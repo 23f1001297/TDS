@@ -16,7 +16,6 @@ app = FastAPI(title="A2A Invoice Agent", version="1.0.0")
 # In-memory storage for tasks and idempotency (keyed by principal and message hash)
 TASKS_DB: Dict[str, Dict[str, Any]] = {}
 IDEMPOTENCY_DB: Dict[str, Dict[str, Any]] = {}  # principal:msg_id -> {hash, task_id}
-PACKAGE_CACHE: Dict[str, Dict[str, Any]] = {}   # pkg_content_hash -> decision dict
 
 def get_principal(authorization: Optional[str] = Header(None)) -> str:
     if not authorization or not authorization.startswith("Bearer "):
@@ -44,7 +43,6 @@ def a2a_response(content: Any, status_code: int = 200) -> JSONResponse:
 
 @app.get("/.well-known/agent-card.json")
 def get_agent_card(request: Request):
-    # Base URL provided by host/request
     base_url = str(request.base_url).rstrip("/")
     if base_url.startswith("http://"):
         base_url = "https://" + base_url[7:]
@@ -139,4 +137,152 @@ async def message_send(
                         evidence_refs.append(ref)
 
             while len(evidence_refs) < 3:
-                evidence_refs.append(f"
+                evidence_refs.append(f"ref-{len(evidence_refs)+1}")
+
+            proposals.append({
+                "packageId": pkg_id,
+                "actionId": action_id,
+                "action": chosen_action,
+                "facts": {
+                    "vendorName": vendor,
+                    "invoiceNumber": inv_num,
+                    "amountMinor": amount,
+                    "currency": currency
+                },
+                "evidenceRefs": evidence_refs[:3],
+                "rationale": f"Action {chosen_action} chosen based on verified compliance citing evidence records."
+            })
+
+        task_id = f"task_{hashlib.sha256((idempotency_key + msg_hash).encode()).hexdigest()[:16]}"
+        context_id = f"ctx_{batch_id}"
+        
+        task = {
+            "id": task_id,
+            "contextId": context_id,
+            "state": "TASK_STATE_INPUT_REQUIRED",
+            "history": [message],
+            "artifacts": [{
+                "mediaType": "application/vnd.ga5.invoice-action-proposals+json",
+                "data": {
+                    "batchId": batch_id,
+                    "proposals": proposals
+                }
+            }],
+            "principal": principal
+        }
+        
+        if principal not in TASKS_DB:
+            TASKS_DB[principal] = {}
+        TASKS_DB[principal][task_id] = task
+        IDEMPOTENCY_DB[idempotency_key] = {"hash": msg_hash, "task_id": task_id}
+        
+        return a2a_response({"task": task})
+
+    # SCENARIO B: Results Continuation (Completion)
+    elif results_data:
+        task_id = message.get("taskId")
+        context_id = message.get("contextId")
+        
+        if not task_id or principal not in TASKS_DB or task_id not in TASKS_DB[principal]:
+            raise HTTPException(
+                status_code=404, 
+                detail="Task not found",
+                headers={"Content-Type": "application/a2a+json"}
+            )
+        
+        task = TASKS_DB[principal][task_id]
+        
+        if task.get("contextId") != context_id:
+            raise HTTPException(
+                status_code=400, 
+                detail="Context ID mismatch",
+                headers={"Content-Type": "application/a2a+json"}
+            )
+            
+        if task["state"] == "TASK_STATE_CANCELED":
+            raise HTTPException(
+                status_code=409, 
+                detail="Task already canceled",
+                headers={"Content-Type": "application/a2a+json"}
+            )
+
+        results = results_data.get("results", [])
+        batch_id = results_data.get("batchId", "batch-1")
+        
+        executions = []
+        proposal_artifact = next((art for art in task["artifacts"] if art.get("mediaType") == "application/vnd.ga5.invoice-action-proposals+json"), None)
+        
+        if proposal_artifact:
+            proposals_map = {p["packageId"]: p for p in proposal_artifact["data"]["proposals"]}
+            for res in results:
+                if res.get("outcome") == "ACCEPTED":
+                    pkg_id = res.get("packageId")
+                    if pkg_id in proposals_map:
+                        prop = proposals_map[pkg_id]
+                        executions.append({
+                            "packageId": pkg_id,
+                            "actionId": prop["actionId"],
+                            "action": prop["action"],
+                            "receiptNonce": res.get("receiptNonce"),
+                            "facts": prop["facts"],
+                            "evidenceRefs": prop["evidenceRefs"]
+                        })
+
+        task["state"] = "TASK_STATE_COMPLETED"
+        task["history"].append(message)
+        task["artifacts"].append({
+            "mediaType": "application/vnd.ga5.invoice-action-receipts+json",
+            "data": {
+                "batchId": batch_id,
+                "executions": executions
+            }
+        })
+        
+        IDEMPOTENCY_DB[idempotency_key] = {"hash": msg_hash, "task_id": task_id}
+        return a2a_response({"task": task})
+
+    raise HTTPException(
+        status_code=400, 
+        detail="Invalid message payload structure",
+        headers={"Content-Type": "application/a2a+json"}
+    )
+
+@app.get("/tasks")
+def list_tasks(authorization: Optional[str] = Header(None)):
+    principal = get_principal(authorization)
+    user_tasks = list(TASKS_DB.get(principal, {}).values())
+    return a2a_response({"tasks": user_tasks})
+
+@app.get("/tasks/{id}")
+def get_task(id: str, authorization: Optional[str] = Header(None)):
+    principal = get_principal(authorization)
+    user_tasks = TASKS_DB.get(principal, {})
+    if id not in user_tasks:
+        raise HTTPException(
+            status_code=404, 
+            detail="Task not found",
+            headers={"Content-Type": "application/a2a+json"}
+        )
+    return a2a_response(user_tasks[id])
+
+@app.post("/tasks/{id}:cancel")
+def cancel_task(id: str, authorization: Optional[str] = Header(None)):
+    principal = get_principal(authorization)
+    user_tasks = TASKS_DB.get(principal, {})
+    if id not in user_tasks:
+        raise HTTPException(
+            status_code=404, 
+            detail="Task not found",
+            headers={"Content-Type": "application/a2a+json"}
+        )
+    
+    task = user_tasks[id]
+    if task["state"] == "TASK_STATE_COMPLETED":
+        raise HTTPException(
+            status_code=409, 
+            detail="Cannot cancel completed task",
+            headers={"Content-Type": "application/a2a+json"}
+        )
+    
+    task["state"] = "TASK_STATE_CANCELED"
+    return a2a_response(task)
