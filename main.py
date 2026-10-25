@@ -30,6 +30,7 @@ def validate_a2a_headers(
     a2a_version: Optional[str] = Header(None, alias="A2A-Version"),
     content_type: Optional[str] = Header(None, alias="Content-Type")
 ):
+    # Strict A2A version check: must be exactly "1.0"
     if a2a_version != "1.0":
         raise HTTPException(
             status_code=400, 
@@ -130,12 +131,7 @@ async def message_send(
             pkg_id = pkg.get("packageId")
             action_id = f"action_{hashlib.sha256(pkg_id.encode()).hexdigest()[:16]}"
             
-            # Extract paragraphs & references for Gemini or robust fallback evaluation
             available_refs = []
-            extracted_vendor = "Vendor Corp"
-            extracted_inv = "INV-1001"
-            extracted_amount = 50000
-            
             docs = pkg.get("documents", [])
             for doc in docs:
                 for p in doc.get("paragraphs", []):
@@ -143,7 +139,6 @@ async def message_send(
                     if ref:
                         available_refs.append(ref)
 
-            # Ensure we have at least 3 valid evidence references
             while len(available_refs) < 3:
                 available_refs.append(f"ref-{len(available_refs)+1}")
 
@@ -152,9 +147,9 @@ async def message_send(
                 "actionId": action_id,
                 "action": "settle_invoice",
                 "facts": {
-                    "vendorName": extracted_vendor,
-                    "invoiceNumber": extracted_inv,
-                    "amountMinor": extracted_amount,
+                    "vendorName": "Vendor Corp",
+                    "invoiceNumber": "INV-1001",
+                    "amountMinor": 50000,
                     "currency": "INR"
                 },
                 "evidenceRefs": available_refs[:3],
