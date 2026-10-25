@@ -13,9 +13,9 @@ if GEMINI_API_KEY:
 
 app = FastAPI(title="A2A Invoice Agent", version="1.0.0")
 
-# In-memory storage for tasks and idempotency (keyed by principal and message hash)
+# In-memory storage for tasks and idempotency
 TASKS_DB: Dict[str, Dict[str, Any]] = {}
-IDEMPOTENCY_DB: Dict[str, Dict[str, Any]] = {}  # principal:msg_id -> {hash, task_id}
+IDEMPOTENCY_DB: Dict[str, Dict[str, Any]] = {}
 
 def get_principal(authorization: Optional[str] = Header(None)) -> str:
     if not authorization or not authorization.startswith("Bearer "):
@@ -26,11 +26,20 @@ def get_principal(authorization: Optional[str] = Header(None)) -> str:
         )
     return authorization.split(" ")[1]
 
-def validate_a2a_headers(a2a_version: Optional[str] = Header(None, alias="A2A-Version")):
+def validate_a2a_headers(
+    a2a_version: Optional[str] = Header(None, alias="A2A-Version"),
+    content_type: Optional[str] = Header(None, alias="Content-Type")
+):
     if a2a_version != "1.0":
         raise HTTPException(
             status_code=400, 
             detail="Invalid or missing A2A-Version header (expected 1.0)",
+            headers={"Content-Type": "application/a2a+json"}
+        )
+    if content_type and "application/a2a+json" not in content_type:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid Content-Type (expected application/a2a+json)",
             headers={"Content-Type": "application/a2a+json"}
         )
 
@@ -74,10 +83,11 @@ def get_agent_card(request: Request):
 async def message_send(
     request: Request,
     authorization: Optional[str] = Header(None),
-    a2a_version: Optional[str] = Header(None, alias="A2A-Version")
+    a2a_version: Optional[str] = Header(None, alias="A2A-Version"),
+    content_type: Optional[str] = Header(None, alias="Content-Type")
 ):
     principal = get_principal(authorization)
-    validate_a2a_headers(a2a_version)
+    validate_a2a_headers(a2a_version, content_type)
     
     body = await request.json()
     message = body.get("message", {})
@@ -94,13 +104,11 @@ async def message_send(
         elif media_type == "application/vnd.ga5.invoice-action-results+json":
             results_data = part.get("data")
 
-    # Canonical Hash of Message
     msg_bytes = json.dumps(message, sort_keys=True, separators=(',', ':')).encode("utf-8")
     msg_hash = hashlib.sha256(msg_bytes).hexdigest()
     
     idempotency_key = f"{principal}:{message_id}"
 
-    # Check Idempotency Conflict & Replay
     if idempotency_key in IDEMPOTENCY_DB:
         record = IDEMPOTENCY_DB[idempotency_key]
         if record["hash"] != msg_hash:
@@ -112,7 +120,7 @@ async def message_send(
         existing_task_id = record["task_id"]
         return a2a_response({"task": TASKS_DB[principal][existing_task_id]})
 
-    # SCENARIO A: Initial Invoice Claim Batch (Proposals)
+    # SCENARIO A: Initial Invoice Claim Batch
     if batch_data:
         batch_id = batch_data.get("batchId", "batch-1")
         packages = batch_data.get("packages", [])
@@ -178,7 +186,7 @@ async def message_send(
         
         return a2a_response({"task": task})
 
-    # SCENARIO B: Results Continuation (Completion)
+    # SCENARIO B: Results Continuation
     elif results_data:
         task_id = message.get("taskId")
         context_id = message.get("contextId")
