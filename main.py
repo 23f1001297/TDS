@@ -6,14 +6,12 @@ from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 import google.generativeai as genai
 
-# Initialize Gemini API
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
 app = FastAPI(title="A2A Invoice Agent", version="1.0.0")
 
-# In-memory storage for tasks and idempotency
 TASKS_DB: Dict[str, Dict[str, Any]] = {}
 IDEMPOTENCY_DB: Dict[str, Dict[str, Any]] = {}
 
@@ -30,7 +28,6 @@ def validate_a2a_headers(
     a2a_version: Optional[str] = Header(None, alias="A2A-Version"),
     content_type: Optional[str] = Header(None, alias="Content-Type")
 ):
-    # Strict A2A version check: must be exactly "1.0"
     if a2a_version != "1.0":
         raise HTTPException(
             status_code=400, 
@@ -53,6 +50,7 @@ def a2a_response(content: Any, status_code: int = 200) -> JSONResponse:
 
 @app.get("/.well-known/agent-card.json")
 def get_agent_card(request: Request):
+    # Ensure https scheme for public URL
     base_url = str(request.base_url).rstrip("/")
     if base_url.startswith("http://"):
         base_url = "https://" + base_url[7:]
@@ -61,18 +59,27 @@ def get_agent_card(request: Request):
         "name": "A2A Invoice Action Agent",
         "description": "An agent that evaluates invoice claims and proposes safe actions.",
         "version": "1.0.0",
-        "capabilities": {"streaming": False, "pushNotifications": False},
-        "skills": [{
-            "name": "invoice_action_agent",
-            "description": "Reviews invoice packages and chooses business actions.",
-            "tags": ["invoice", "finance", "action"]
-        }],
-        "supportedInterfaces": [{
-            "protocolBinding": "HTTP+JSON",
-            "protocolVersion": "1.0",
-            "url": base_url
-        }],
-        "defaultInputModes": ["application/vnd.ga5.invoice-claim-batch+json"],
+        "capabilities": {
+            "streaming": False,
+            "pushNotifications": False
+        },
+        "skills": [
+            {
+                "name": "invoice_action_agent",
+                "description": "Reviews invoice packages and chooses business actions.",
+                "tags": ["invoice", "finance", "action"]
+            }
+        ],
+        "supportedInterfaces": [
+            {
+                "protocolBinding": "HTTP+JSON",
+                "protocolVersion": "1.0",
+                "url": base_url
+            }
+        ],
+        "defaultInputModes": [
+            "application/vnd.ga5.invoice-claim-batch+json"
+        ],
         "defaultOutputModes": [
             "application/vnd.ga5.invoice-action-proposals+json",
             "application/vnd.ga5.invoice-action-receipts+json"
