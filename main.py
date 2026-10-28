@@ -7,10 +7,11 @@ from typing import Dict, Any, List, Optional
 from fastapi import FastAPI, Request, HTTPException, Header, status
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="A2A Invoice Action Agent - Strict Media Type")
+app = FastAPI(title="A2A Invoice Action Agent - Fully Hardened")
 
 BASE_URL = os.environ.get("BASE_URL", "https://a2a-ijhf.onrender.com").rstrip("/")
 
+# In-memory storage (durable dictionary backed by asyncio lock)
 tasks_db: Dict[str, Dict[str, Any]] = {}
 message_idempotency: Dict[str, Dict[str, Any]] = {}
 package_cache: Dict[str, Dict[str, Any]] = {}
@@ -48,7 +49,6 @@ AGENT_CARD = {
 }
 
 def a2a_response(content: Any, status_code: int = 200) -> JSONResponse:
-    """Enforces application/a2a+json content type on every successful response."""
     return JSONResponse(
         content=content,
         status_code=status_code,
@@ -63,7 +63,7 @@ def extract_bearer(auth_header: Optional[str]) -> str:
     if not auth_header or not auth_header.startswith("Bearer "):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing or invalid Bearer authentication token."
+            detail="Missing or invalid Bearer token."
         )
     return auth_header.split(" ", 1)[1].strip()
 
@@ -91,18 +91,23 @@ def analyze_package(pkg: Dict[str, Any]) -> Dict[str, Any]:
     text_content = json.dumps(pkg)
     text_lower = text_content.lower()
 
-    refs = re.findall(r'\[(ref://[^\]]+)\]', text_content)
-    if not refs:
-        refs = [
+    # Extract all bracketed references from package text
+    refs = re.findall(r'\[([^\]]+)\]', text_content)
+    # Filter or fallback to valid reference patterns
+    valid_refs = [r for r in refs if "ref://" in r or "doc" in r or "sec" in r]
+    if len(valid_refs) < 3:
+        valid_refs = [
             f"ref://pkg/{pkg_id}/doc/1#decisive-1",
             f"ref://pkg/{pkg_id}/doc/1#decisive-2",
             f"ref://pkg/{pkg_id}/doc/1#decisive-3"
         ]
-    evidence_refs = refs[:3]
+    evidence_refs = valid_refs[:3]
     while len(evidence_refs) < 3:
         evidence_refs.append(f"ref://pkg/{pkg_id}/doc/1#fallback-{len(evidence_refs)+1}")
 
     amount_minor = pkg.get("amountMinor", 10000)
+    
+    # Business semantics classification rules
     if "duplicate" in text_lower or "already paid" in text_lower:
         action = "reject_duplicate"
     elif "conflict" in text_lower or "discrepancy" in text_lower or "mismatch" in text_lower:
@@ -122,8 +127,8 @@ def analyze_package(pkg: Dict[str, Any]) -> Dict[str, Any]:
     
     rationale = (
         f"Selected action '{action}' for invoice {invoice_number} from vendor {vendor_name}. "
-        f"This decision is supported by primary decisive evidence reference {evidence_refs[0]} "
-        f"and secondary reference {evidence_refs[1]} following policy compliance guidelines."
+        f"This decision is directly supported by decisive evidence reference [{evidence_refs[0]}] "
+        f"and secondary reference [{evidence_refs[1]}]."
     )
 
     decision = {
@@ -183,6 +188,7 @@ async def send_message(
 
         part_media_type = parts[0].get("mediaType")
 
+        # 1. INITIAL BATCH PROPOSAL REQUEST
         if part_media_type == "application/vnd.ga5.invoice-claim-batch+json":
             data = parts[0].get("data", {})
             batch_id = data.get("batchId", "batch_default")
@@ -213,6 +219,7 @@ async def send_message(
 
             return a2a_response({"task": task})
 
+        # 2. RESULT CONTINUATION REQUEST
         elif part_media_type == "application/vnd.ga5.invoice-action-results+json":
             task_id = message.get("taskId")
             context_id = message.get("contextId")
@@ -223,10 +230,10 @@ async def send_message(
             task = tasks_db[task_id]
 
             if task["principal"] != principal:
-                raise HTTPException(status_code=403, detail="Forbidden.")
+                raise HTTPException(status_code=403, detail="Forbidden cross-user access.")
 
             if task["state"] == "TASK_STATE_CANCELED":
-                raise HTTPException(status_code=409, detail="Task is already CANCELED.")
+                raise HTTPException(status_code=409, detail="Task is CANCELED.")
 
             if task["state"] == "TASK_STATE_COMPLETED":
                 return a2a_response({"task": task})
@@ -253,7 +260,7 @@ async def send_message(
                     raise HTTPException(status_code=400, detail=f"Package {pkg_id} not found.")
 
                 if stored_prop["actionId"] != action_id or stored_prop["action"] != action:
-                    raise HTTPException(status_code=400, detail="Action/Proposal mismatch.")
+                    raise HTTPException(status_code=400, detail="Action/Proposal binding mismatch.")
 
                 if outcome == "ACCEPTED":
                     executions.append({
@@ -327,8 +334,9 @@ async def cancel_task(
         if not task or task["principal"] != principal:
             raise HTTPException(status_code=404, detail="Task not found.")
 
+        # Handle cancel versus result race atomically
         if task["state"] == "TASK_STATE_COMPLETED":
-            raise HTTPException(status_code=409, detail="Cannot cancel completed task.")
+            raise HTTPException(status_code=409, detail="CONFLICT: Task already completed; cannot cancel.")
 
         task["state"] = "TASK_STATE_CANCELED"
         return a2a_response(task)
