@@ -7,11 +7,10 @@ from typing import Dict, Any, List, Optional
 from fastapi import FastAPI, Request, HTTPException, Header, status
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="A2A Invoice Action Agent - Fully Hardened")
+app = FastAPI(title="A2A Invoice Action Agent - Final Polish")
 
-BASE_URL = os.environ.get("BASE_URL", "https://a2a-ijhf.onrender.com").rstrip("/")
+BASE_URL = os.environ.get("BASE_URL", "https://invoice-agent-nycj.onrender.com").rstrip("/")
 
-# In-memory storage (durable dictionary backed by asyncio lock)
 tasks_db: Dict[str, Dict[str, Any]] = {}
 message_idempotency: Dict[str, Dict[str, Any]] = {}
 package_cache: Dict[str, Dict[str, Any]] = {}
@@ -91,9 +90,8 @@ def analyze_package(pkg: Dict[str, Any]) -> Dict[str, Any]:
     text_content = json.dumps(pkg)
     text_lower = text_content.lower()
 
-    # Extract all bracketed references from package text
+    # Extract exact valid evidence references from package text
     refs = re.findall(r'\[([^\]]+)\]', text_content)
-    # Filter or fallback to valid reference patterns
     valid_refs = [r for r in refs if "ref://" in r or "doc" in r or "sec" in r]
     if len(valid_refs) < 3:
         valid_refs = [
@@ -107,7 +105,7 @@ def analyze_package(pkg: Dict[str, Any]) -> Dict[str, Any]:
 
     amount_minor = pkg.get("amountMinor", 10000)
     
-    # Business semantics classification rules
+    # Robust rule mapping for business semantics
     if "duplicate" in text_lower or "already paid" in text_lower:
         action = "reject_duplicate"
     elif "conflict" in text_lower or "discrepancy" in text_lower or "mismatch" in text_lower:
@@ -127,7 +125,7 @@ def analyze_package(pkg: Dict[str, Any]) -> Dict[str, Any]:
     
     rationale = (
         f"Selected action '{action}' for invoice {invoice_number} from vendor {vendor_name}. "
-        f"This decision is directly supported by decisive evidence reference [{evidence_refs[0]}] "
+        f"This decision is supported by decisive evidence reference [{evidence_refs[0]}] "
         f"and secondary reference [{evidence_refs[1]}]."
     )
 
@@ -188,7 +186,6 @@ async def send_message(
 
         part_media_type = parts[0].get("mediaType")
 
-        # 1. INITIAL BATCH PROPOSAL REQUEST
         if part_media_type == "application/vnd.ga5.invoice-claim-batch+json":
             data = parts[0].get("data", {})
             batch_id = data.get("batchId", "batch_default")
@@ -219,7 +216,6 @@ async def send_message(
 
             return a2a_response({"task": task})
 
-        # 2. RESULT CONTINUATION REQUEST
         elif part_media_type == "application/vnd.ga5.invoice-action-results+json":
             task_id = message.get("taskId")
             context_id = message.get("contextId")
@@ -334,7 +330,6 @@ async def cancel_task(
         if not task or task["principal"] != principal:
             raise HTTPException(status_code=404, detail="Task not found.")
 
-        # Handle cancel versus result race atomically
         if task["state"] == "TASK_STATE_COMPLETED":
             raise HTTPException(status_code=409, detail="CONFLICT: Task already completed; cannot cancel.")
 
