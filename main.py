@@ -56,10 +56,11 @@ def gate(req: Request, post=False):
 def load(tid, principal):
     r = db.execute("SELECT body FROM tasks WHERE id=? AND principal=?", (tid, principal)).fetchone()
     return json.loads(r[0]) if r else None
+
 def save(task, principal):
     db.execute("INSERT OR REPLACE INTO tasks VALUES(?,?,?)", (task["id"], principal, json.dumps(task)))
 
-# ---------- public Agent Card (origin-level discovery) ----------
+# ---------- public Agent Card ----------
 @app.get("/.well-known/agent-card.json")
 @app.get("/a2a/.well-known/agent-card.json")
 def card():
@@ -208,3 +209,56 @@ async def decide(policy, packages):
     verdict_of = {p["packageId"]: v for p, v in zip(settles, verdicts)}
 
     for p in pending:
+        pid, text = p["packageId"], canon(p)
+        d = fresh.get(pid)
+        cacheable = True
+        if d is None:
+            d = {"action": "open_exception", "vendorName": "unknown", "invoiceNumber": "unknown",
+                 "amountMinor": 0, "currency": "INR", "evidenceRefs": ["", "", ""], "reason": ""}
+            cacheable = False
+        elif d["action"] == "settle_invoice":
+            v = verdict_of.get(pid)
+            if v is None:
+                d = {**d, "action": "open_exception"}
+                cacheable = False
+            elif settle_confirmed(v, text):
+                d = {**d, "reason": v.get("reason") or d.get("reason", "")}
+            elif v.get("action") in ACTIONS - {"settle_invoice"} and refs_ok(v.get("evidenceRefs"), text):
+                d = {**d, "action": v["action"], "evidenceRefs": v["evidenceRefs"], "reason": v.get("reason", "")}
+            else:
+                d = {**d, "action": "open_exception"}
+        out[pid] = d
+        log_line({"packageId": pid, "first": (fresh.get(pid) or {}).get("action"),
+                  "final": d["action"], "refs": d["evidenceRefs"], "verdict": verdict_of.get(pid)})
+        if d["action"] == "settle_invoice":
+            log_line({"SETTLED_PACKAGE": pid, "text": text})
+        if cacheable:
+            db.execute("INSERT OR REPLACE INTO cache VALUES(?,?)", (pkg_key(p), json.dumps(d)))
+    db.commit()
+    return out
+
+def proposal(p, d, policy):
+    a, r = d["action"], d["evidenceRefs"]
+    rationale = (f"Proposing {a} for invoice {d['invoiceNumber']} from {d['vendorName']}. "
+                 f"{d.get('reason', '')} Evidence {r[0]}, {r[1]} and {r[2]} in the controlling paragraph support {a}.")[:1500]
+    return {"packageId": p["packageId"], "actionId": "act-" + uuid.uuid4().hex, "action": a,
+            "facts": {"vendorName": d["vendorName"], "invoiceNumber": d["invoiceNumber"],
+                      "amountMinor": d["amountMinor"], "currency": d["currency"]},
+            "evidenceRefs": r, "rationale": rationale}
+
+# ---------- message:send ----------
+@app.post("/a2a/message:send")
+@app.post("/message:send")
+async def message_send(req: Request):
+    principal, bad = gate(req, post=True)
+    if bad: return bad
+    try:
+        body = await req.json(); msg = body["message"]; mid = msg["messageId"]
+        assert isinstance(msg["parts"], list)
+    except Exception:
+        return err(400, "INVALID_REQUEST")
+    h = sha(canon(msg))
+    lock = key_locks.setdefault((principal, mid), asyncio.Lock())
+    async with lock:
+        with dblock:
+            seen = db.execute("SELECT hash, task_id FROM msgs WHERE principal=? AND mid=?", (principal, mid
