@@ -75,36 +75,36 @@ def card():
         "description": "Reads invoice packages, proposes safe business actions with evidence, executes only approved ones.",
         "version": "1.0.0",
         "supportedInterfaces": [{"url": BASE_URL, "protocolBinding": "HTTP+JSON", "protocolVersion": "1.0"}],
-        "capabilities": {"streaming": False, "pushNotifications": False},
+        "capabilities": {"invoice_processing": True, "evidence_citation": True, "idempotency": True},
         "defaultInputModes": [BATCH_T, RES_T],
         "defaultOutputModes": [PROP_T, REC_T],
-        "skills": [{"id": "invoice_action_agent", "name": "Invoice action agent",
-                    "description": "Choose settle/approve/hold/reject/exception for each invoice.",
-                    "tags": ["invoice", "finance", "approval"]}],
+        "skills": [{
+            "id": "invoice_action_agent", 
+            "name": "Invoice Action Agent",
+            "description": "Evaluates invoices against delegated authority and commercial validity rules.",
+            "tags": ["invoices", "finance", "approval", "invoice-action"]
+        }],
     })
 
-PROMPT = """You are an accounts-payable analyst. For EACH package choose exactly one action:
+PROMPT = """You are an expert accounts-payable auditor. Evaluate EACH invoice package independently based strictly on its own unique case facts. Do NOT apply blanket actions.
+
+For each package, choose exactly one action:
 settle_invoice, request_approval, hold_invoice, reject_duplicate, open_exception.
 
-Decision rules, apply in this order:
-1. The SAME invoice (same vendor AND same invoice number) was already paid -> reject_duplicate.
-   A payment for a DIFFERENT invoice number is NOT a duplicate.
-2. Vendor, amount, PO or receipt records materially conflict -> open_exception.
-3. A named verification (bank details, tax ID, goods receipt, etc.) must finish before payment -> hold_invoice.
-4. Amount exceeds the autonomous approval limit that applies to this case -> request_approval.
-5. ONLY if none of the above apply -> settle_invoice.
+Strict Rules:
+1. reject_duplicate: ONLY if the exact same invoice (same vendor AND same invoice number) appears as previously paid in the record. A different invoice number is never a duplicate.
+2. open_exception: If vendor records, PO, amounts, or line items materially conflict or mismatch.
+3. hold_invoice: If explicit verification (bank info, goods receipt confirmation, tax ID check) is required before payment.
+4. request_approval: If the invoice amount strictly exceeds the autonomous authority limit for that specific case context.
+5. settle_invoice: ONLY when all records are fully valid, reconciled, within authority, and require no pending verifications.
 
-How to read the documents:
-- Find the ONE paragraph that states the controlling facts of THIS case. Return its three bracketed references,
-  copied exactly, brackets included, all from that single paragraph.
-- Ignore the cover sheet, archive examples, training material and decoys.
-- Negated statements ("not a duplicate", "no hold required") mean that action does NOT apply.
-- When unsure between settle_invoice and anything else, do NOT choose settle_invoice.
+Evidence Requirements:
+- Locate the single paragraph containing the controlling facts for the package.
+- Extract exactly three unique bracketed reference strings (e.g., ["ref://...", "ref://...", "ref://..."]) strictly from that controlling paragraph.
+- Provide a concise, clear rationale explaining how those exact references justify the chosen action.
 
-Also return vendorName, invoiceNumber, amountMinor (integer, smallest currency unit, e.g. 1234.50 -> 123450),
-currency, and "reason": one sentence on why the evidence supports the action.
-Reply ONLY JSON: {"decisions":[{"packageId":"","action":"","vendorName":"","invoiceNumber":"","amountMinor":0,
-"currency":"","evidenceRefs":["","",""],"reason":""}]}"""
+Reply ONLY JSON:
+{"decisions":[{"packageId":"","action":"","vendorName":"","invoiceNumber":"","amountMinor":0,"currency":"","evidenceRefs":["","",""],"reason":""}]}"""
 
 CHECKS = ["valid_and_reconciled", "within_authority", "no_pending_verification",
           "not_already_paid", "no_conflicting_records"]
