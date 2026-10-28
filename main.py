@@ -1,13 +1,21 @@
-import os, json, hashlib, sqlite3, threading, asyncio, uuid, re, datetime
+import os
+import json
+import hashlib
+import sqlite3
+import threading
+import asyncio
+import uuid
+import re
+import datetime
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 import traceback
 
-BASE_URL = "https://luck-fiber-few-bus.trycloudflare.com/a2a/"
+BASE_URL = os.environ.get("BASE_URL", "https://invoice-agent-nycj.onrender.com").rstrip("/") + "/a2a/"
 LLM_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-LLM_KEY = "GEMINI_API_KEY"
-LLM_MODEL = "gemini-3.5-flash-lite"
+LLM_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSy...") # Or your key
+LLM_MODEL = "gemini-2.5-flash"
 MEDIA = "application/a2a+json"
 BATCH_T = "application/vnd.ga5.invoice-claim-batch+json"
 PROP_T = "application/vnd.ga5.invoice-action-proposals+json"
@@ -16,7 +24,9 @@ REC_T = "application/vnd.ga5.invoice-action-receipts+json"
 ACTIONS = {"settle_invoice", "request_approval", "hold_invoice", "reject_duplicate", "open_exception"}
 TERMINAL = {"TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"}
 
-app_Q2 = FastAPI()
+# Must be named 'app' for uvicorn main:app
+app = FastAPI()
+
 db = sqlite3.connect("state.db", check_same_thread=False)
 db.executescript("""
 CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, principal TEXT, body TEXT);
@@ -51,7 +61,7 @@ def save(task, principal):
     db.execute("INSERT OR REPLACE INTO tasks VALUES(?,?,?)", (task["id"], principal, json.dumps(task)))
 
 # ---------- public Agent Card ----------
-@app_Q2.get("/.well-known/agent-card.json")
+@app.get("/.well-known/agent-card.json")
 def card():
     return reply({
         "name": "Invoice Action Agent",
@@ -204,25 +214,25 @@ async def decide(policy, packages):
         pid, text = p["packageId"], canon(p)
         d = fresh.get(pid)
         cacheable = True
-        if d is None:                                   # AI failed twice
+        if d is None:                            # AI failed twice
             d = {"action": "open_exception", "vendorName": "unknown", "invoiceNumber": "unknown",
                  "amountMinor": 0, "currency": "INR", "evidenceRefs": ["", "", ""], "reason": ""}
             cacheable = False
         elif d["action"] == "settle_invoice":
             v = verdict_of.get(pid)
-            if v is None:                               # verifier failed -> never settle
+            if v is None:                        # verifier failed -> never settle
                 d = {**d, "action": "open_exception"}
                 cacheable = False
             elif settle_confirmed(v, text):
-                d = {**d, "reason": v.get("reason") or d.get("reason", "")}   # confirmed
+                d = {**d, "reason": v.get("reason") or d.get("reason", "")}    # confirmed
             elif v.get("action") in ACTIONS - {"settle_invoice"} and refs_ok(v.get("evidenceRefs"), text):
                 d = {**d, "action": v["action"], "evidenceRefs": v["evidenceRefs"], "reason": v.get("reason", "")}
-            else:                                       # disagreement we can't resolve
+            else:                                # disagreement we can't resolve
                 d = {**d, "action": "open_exception"}
         out[pid] = d
         log_line({"packageId": pid, "first": (fresh.get(pid) or {}).get("action"),
                   "final": d["action"], "refs": d["evidenceRefs"], "verdict": verdict_of.get(pid)})
-        if d["action"] == "settle_invoice":             # keep the text of every settle so you can read it
+        if d["action"] == "settle_invoice":      # keep the text of every settle so you can read it
             log_line({"SETTLED_PACKAGE": pid, "text": text})
         if cacheable:
             db.execute("INSERT OR REPLACE INTO cache VALUES(?,?)", (pkg_key(p), json.dumps(d)))
@@ -239,7 +249,7 @@ def proposal(p, d, policy):
             "evidenceRefs": r, "rationale": rationale}
 
 # ---------- message:send ----------
-@app_Q2.post("/a2a/message:send")
+@app.post("/a2a/message:send")
 async def message_send(req: Request):
     principal, bad = gate(req, post=True)
     if bad: return bad
@@ -248,7 +258,7 @@ async def message_send(req: Request):
         assert isinstance(msg["parts"], list)
     except Exception:
         return err(400, "INVALID_REQUEST")
-    h = sha(canon(msg))                         # configuration is ignored on purpose
+    h = sha(canon(msg))              # configuration is ignored on purpose
     lock = key_locks.setdefault((principal, mid), asyncio.Lock())
     async with lock:
         with dblock:
@@ -269,7 +279,7 @@ async def message_send(req: Request):
                 "artifacts": [{"artifactId": "proposals", "name": "invoice-action-proposals",
                                "parts": [{"mediaType": PROP_T, "data": {"batchId": data["batchId"], "proposals": props}}]}],
                 "history": [{**msg, "taskId": tid, "contextId": cid}]}
-        with dblock:                                                   # store BEFORE responding
+        with dblock:                                                # store BEFORE responding
             save(task, principal)
             db.execute("INSERT INTO msgs VALUES(?,?,?,?)", (principal, mid, h, tid))
             db.commit()
@@ -307,7 +317,7 @@ def continuation(principal, msg, part, mid, h):
         return reply({"task": task})
 
 # ---------- reads, list, cancel (NO model calls) ----------
-@app_Q2.get("/a2a/tasks/{tid}")
+@app.get("/a2a/tasks/{tid}")
 def get_task(tid: str, req: Request):
     principal, bad = gate(req)
     if bad: return bad
@@ -316,7 +326,7 @@ def get_task(tid: str, req: Request):
 
 MAX_LIST_BYTES = 350_000
 
-@app_Q2.get("/a2a/tasks")
+@app.get("/a2a/tasks")
 def list_tasks(req: Request):
     principal, bad = gate(req)
     if bad: return bad
@@ -334,7 +344,7 @@ def list_tasks(req: Request):
         size += n
     return reply({"tasks": tasks})
 
-@app_Q2.post("/a2a/tasks/{tid}:cancel")
+@app.post("/a2a/tasks/{tid}:cancel")
 def cancel(tid: str, req: Request):
     principal, bad = gate(req)
     if bad: return bad
