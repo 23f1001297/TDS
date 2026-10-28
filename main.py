@@ -35,13 +35,21 @@ CREATE TABLE IF NOT EXISTS cache(h TEXT PRIMARY KEY, body TEXT);
 dblock = threading.RLock()
 key_locks = {}
 
-def now(): return datetime.datetime.now(datetime.timezone.utc).isoformat()
-def canon(o): return json.dumps(o, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-def sha(s): return hashlib.sha256(s.encode()).hexdigest()
-def reply(obj, code=200): return JSONResponse(obj, status_code=code, media_type=MEDIA)
-def err(code, name, msg="Request failed"): return reply({"error": {"code": name, "message": msg}}, code)
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
-# ---------- gatekeeping ----------
+def canon(o):
+    return json.dumps(o, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+def sha(s):
+    return hashlib.sha256(s.encode()).hexdigest()
+
+def reply(obj, code=200):
+    return JSONResponse(obj, status_code=code, media_type=MEDIA)
+
+def err(code, name, msg="Request failed"):
+    return reply({"error": {"code": name, "message": msg}}, code)
+
 def gate(req: Request, post=False):
     auth = req.headers.get("authorization", "")
     if not auth.startswith("Bearer ") or not auth[7:].strip():
@@ -52,7 +60,6 @@ def gate(req: Request, post=False):
         return None, err(415, "UNSUPPORTED_MEDIA_TYPE", "Use application/a2a+json")
     return sha(auth[7:].strip()), None
 
-# ---------- storage ----------
 def load(tid, principal):
     r = db.execute("SELECT body FROM tasks WHERE id=? AND principal=?", (tid, principal)).fetchone()
     return json.loads(r[0]) if r else None
@@ -60,7 +67,6 @@ def load(tid, principal):
 def save(task, principal):
     db.execute("INSERT OR REPLACE INTO tasks VALUES(?,?,?)", (task["id"], principal, json.dumps(task)))
 
-# ---------- public Agent Card ----------
 @app.get("/.well-known/agent-card.json")
 @app.get("/a2a/.well-known/agent-card.json")
 def card():
@@ -77,7 +83,6 @@ def card():
                     "tags": ["invoice", "finance", "approval"]}],
     })
 
-# ---------- AI layer ----------
 PROMPT = """You are an accounts-payable analyst. For EACH package choose exactly one action:
 settle_invoice, request_approval, hold_invoice, reject_duplicate, open_exception.
 
@@ -152,14 +157,8 @@ async def call_llm(system, user, timeout):
             headers={"Content-Type": "application/json", "X-goog-api-key": LLM_KEY},
             json={
                 "systemInstruction": {"parts": [{"text": system}]},
-                "contents": [{
-                    "role": "user", 
-                    "parts": [{"text": user}]
-                }],
-                "generationConfig": {
-                    "temperature": 0, 
-                    "responseMimeType": "application/json"
-                }
+                "contents": [{"role": "user", "parts": [{"text": user}]}],
+                "generationConfig": {"temperature": 0, "responseMimeType": "application/json"}
             })
     r.raise_for_status()
     text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
@@ -246,19 +245,117 @@ def proposal(p, d, policy):
                       "amountMinor": d["amountMinor"], "currency": d["currency"]},
             "evidenceRefs": r, "rationale": rationale}
 
-# ---------- message:send ----------
 @app.post("/a2a/message:send")
 @app.post("/message:send")
 async def message_send(req: Request):
     principal, bad = gate(req, post=True)
     if bad: return bad
     try:
-        body = await req.json(); msg = body["message"]; mid = msg["messageId"]
+        body = await req.json()
+        msg = body["message"]
+        mid = msg["messageId"]
         assert isinstance(msg["parts"], list)
     except Exception:
         return err(400, "INVALID_REQUEST")
+    
     h = sha(canon(msg))
     lock = key_locks.setdefault((principal, mid), asyncio.Lock())
     async with lock:
         with dblock:
-            seen = db.execute("SELECT hash, task_id FROM msgs WHERE principal=? AND mid=?", (principal, mid
+            seen = db.execute("SELECT hash, task_id FROM msgs WHERE principal=? AND mid=?", (principal, mid)).fetchone()
+        if seen:
+            if seen[0] != h: return err(409, "IDEMPOTENCY_CONFLICT", "Message id reused with different content")
+            return reply({"task": load(seen[1], principal)})
+        
+        part = msg["parts"][0]
+        if msg.get("taskId"):
+            return continuation(principal, msg, part, mid, h)
+        if part.get("mediaType") != BATCH_T: return err(400, "INVALID_REQUEST")
+        
+        data = part["data"]
+        pkgs = data["packages"]
+        decisions = await decide(data["policyRevision"], pkgs)
+        props = [proposal(p, decisions[p["packageId"]], data["policyRevision"]) for p in pkgs]
+        tid, cid = str(uuid.uuid4()), str(uuid.uuid4())
+        task = {"id": tid, "contextId": cid,
+                "status": {"state": "TASK_STATE_INPUT_REQUIRED", "timestamp": now()},
+                "artifacts": [{"artifactId": "proposals", "name": "invoice-action-proposals",
+                               "parts": [{"mediaType": PROP_T, "data": {"batchId": data["batchId"], "proposals": props}}]}],
+                "history": [{**msg, "taskId": tid, "contextId": cid}]}
+        with dblock:
+            save(task, principal)
+            db.execute("INSERT INTO msgs VALUES(?,?,?,?)", (principal, mid, h, tid))
+            db.commit()
+        return reply({"task": task})
+
+def continuation(principal, msg, part, mid, h):
+    with dblock:
+        task = load(msg["taskId"], principal)
+        if not task: return err(404, "NOT_FOUND", "Task not found")
+        if msg.get("contextId") != task["contextId"]: return err(400, "INVALID_REQUEST")
+        if task["status"]["state"] != "TASK_STATE_INPUT_REQUIRED": return err(409, "TASK_NOT_ACTIONABLE")
+        if part.get("mediaType") != RES_T: return err(400, "INVALID_REQUEST")
+        stored = task["artifacts"][0]["parts"][0]["data"]
+        data = part["data"]
+        if data.get("batchId") != stored["batchId"]: return err(400, "INVALID_REQUEST")
+        byid = {p["packageId"]: p for p in stored["proposals"]}
+        execs, seen = [], set()
+        for r in data.get("results", []):
+            p = byid.get(r.get("packageId"))
+            if (not p or r["packageId"] in seen or r.get("actionId") != p["actionId"]
+                    or r.get("action") != p["action"] or r.get("outcome") not in ("ACCEPTED", "REJECTED")):
+                return err(400, "INVALID_REQUEST")
+            seen.add(r["packageId"])
+            if r["outcome"] == "ACCEPTED":
+                if not r.get("receiptNonce"): return err(400, "INVALID_REQUEST")
+                execs.append({"packageId": p["packageId"], "actionId": p["actionId"], "action": p["action"],
+                              "receiptNonce": r["receiptNonce"], "facts": p["facts"], "evidenceRefs": p["evidenceRefs"]})
+        task["artifacts"].append({"artifactId": "receipts", "name": "invoice-action-receipts",
+                                  "parts": [{"mediaType": REC_T, "data": {"batchId": stored["batchId"], "executions": execs}}]})
+        task["history"].append({**msg})
+        task["status"] = {"state": "TASK_STATE_COMPLETED", "timestamp": now()}
+        save(task, principal)
+        db.execute("INSERT INTO msgs VALUES(?,?,?,?)", (principal, mid, h, task["id"]))
+        db.commit()
+        return reply({"task": task})
+
+@app.get("/a2a/tasks/{tid}")
+@app.get("/tasks/{tid}")
+def get_task(tid: str, req: Request):
+    principal, bad = gate(req)
+    if bad: return bad
+    with dblock: t = load(tid, principal)
+    return reply(t) if t else err(404, "NOT_FOUND", "Task not found")
+
+MAX_LIST_BYTES = 350_000
+
+@app.get("/a2a/tasks")
+@app.get("/tasks")
+def list_tasks(req: Request):
+    principal, bad = gate(req)
+    if bad: return bad
+    with dblock:
+        rows = db.execute("SELECT body FROM tasks WHERE principal=? ORDER BY rowid DESC LIMIT 20", (principal,)).fetchall()
+    tasks, size = [], 0
+    for (b,) in rows:
+        t = {k: v for k, v in json.loads(b).items() if k != "history"}
+        n = len(json.dumps(t))
+        if tasks and size + n > MAX_LIST_BYTES:
+            break
+        tasks.append(t)
+        size += n
+    return reply({"tasks": tasks})
+
+@app.post("/a2a/tasks/{tid}:cancel")
+@app.post("/tasks/{tid}:cancel")
+def cancel(tid: str, req: Request):
+    principal, bad = gate(req)
+    if bad: return bad
+    with dblock:
+        t = load(tid, principal)
+        if not t: return err(404, "NOT_FOUND", "Task not found")
+        if t["status"]["state"] in TERMINAL: return err(409, "TASK_NOT_CANCELABLE")
+        t["status"] = {"state": "TASK_STATE_CANCELED", "timestamp": now()}
+        save(t, principal)
+        db.commit()
+    return reply(t)
