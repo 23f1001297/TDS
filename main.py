@@ -14,7 +14,7 @@ import traceback
 
 BASE_URL = os.environ.get("BASE_URL", "https://invoice-agent-nycj.onrender.com").rstrip("/") + "/a2a/"
 LLM_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-LLM_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSy...") # Or your key
+LLM_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSy...") 
 LLM_MODEL = "gemini-2.5-flash"
 MEDIA = "application/a2a+json"
 BATCH_T = "application/vnd.ga5.invoice-claim-batch+json"
@@ -24,7 +24,6 @@ REC_T = "application/vnd.ga5.invoice-action-receipts+json"
 ACTIONS = {"settle_invoice", "request_approval", "hold_invoice", "reject_duplicate", "open_exception"}
 TERMINAL = {"TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"}
 
-# Must be named 'app' for uvicorn main:app
 app = FastAPI()
 
 db = sqlite3.connect("state.db", check_same_thread=False)
@@ -33,8 +32,8 @@ CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, principal TEXT, body TEXT)
 CREATE TABLE IF NOT EXISTS msgs(principal TEXT, mid TEXT, hash TEXT, task_id TEXT, PRIMARY KEY(principal, mid));
 CREATE TABLE IF NOT EXISTS cache(h TEXT PRIMARY KEY, body TEXT);
 """)
-dblock = threading.RLock()      # makes "receipt vs cancel" a fair one-at-a-time race
-key_locks = {}                  # makes concurrent duplicate messages wait for the first one
+dblock = threading.RLock()
+key_locks = {}
 
 def now(): return datetime.datetime.now(datetime.timezone.utc).isoformat()
 def canon(o): return json.dumps(o, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -51,7 +50,7 @@ def gate(req: Request, post=False):
         return None, err(400, "VERSION_NOT_SUPPORTED", "Unsupported version")
     if post and not req.headers.get("content-type", "").startswith(MEDIA):
         return None, err(415, "UNSUPPORTED_MEDIA_TYPE", "Use application/a2a+json")
-    return sha(auth[7:].strip()), None      # principal = hash of the token
+    return sha(auth[7:].strip()), None
 
 # ---------- storage ----------
 def load(tid, principal):
@@ -60,8 +59,9 @@ def load(tid, principal):
 def save(task, principal):
     db.execute("INSERT OR REPLACE INTO tasks VALUES(?,?,?)", (task["id"], principal, json.dumps(task)))
 
-# ---------- public Agent Card ----------
+# ---------- public Agent Card (origin-level discovery) ----------
 @app.get("/.well-known/agent-card.json")
+@app.get("/a2a/.well-known/agent-card.json")
 def card():
     return reply({
         "name": "Invoice Action Agent",
@@ -76,7 +76,7 @@ def card():
                     "tags": ["invoice", "finance", "approval"]}],
     })
 
-# ---------- AI layer (separate from protocol code) ----------
+# ---------- AI layer ----------
 PROMPT = """You are an accounts-payable analyst. For EACH package choose exactly one action:
 settle_invoice, request_approval, hold_invoice, reject_duplicate, open_exception.
 
@@ -127,7 +127,6 @@ def valid(d, pkg_text):
             and isinstance(d.get("invoiceNumber"), str) and d["invoiceNumber"])
 
 def settle_confirmed(v, pkg_text):
-    """Python, not the AI, makes the final call: every safety check must be exactly True."""
     c = v.get("checks") or {}
     return (v.get("action") == "settle_invoice"
             and all(c.get(k) is True for k in CHECKS)
@@ -139,7 +138,7 @@ async def verify_settle(policy, p, sem):
             return await call_llm(VERIFY, f"Policy revision: {policy}\nPackage:\n{canon(p)}", 15)
         except Exception:
             traceback.print_exc()
-            return None            # no answer means we will NOT settle
+            return None
 
 def log_line(obj):
     with open("decisions.jsonl", "a") as f:
@@ -178,7 +177,7 @@ async def ask_llm_safe(policy, pkgs):
         traceback.print_exc()
         return []
 
-CACHE_VERSION = "v3"     # bump this number every time you change a prompt or rule
+CACHE_VERSION = "v3"
 
 def pkg_key(p):
     body = {k: v for k, v in p.items() if k != "packageId"}
@@ -192,7 +191,6 @@ async def decide(policy, packages):
         else: todo.append(p)
     pending = list(todo)
 
-    # first pass (one retry for anything invalid)
     for attempt in range(2):
         if not todo: break
         got = {d.get("packageId"): d for d in await ask_llm_safe(policy, todo)}
@@ -203,7 +201,6 @@ async def decide(policy, packages):
             else: still.append(p)
         todo = still
 
-    # second pass: verify every settle_invoice
     by_id = {p["packageId"]: p for p in pending}
     settles = [by_id[i] for i, d in fresh.items() if d["action"] == "settle_invoice"]
     sem = asyncio.Semaphore(4)
@@ -211,147 +208,3 @@ async def decide(policy, packages):
     verdict_of = {p["packageId"]: v for p, v in zip(settles, verdicts)}
 
     for p in pending:
-        pid, text = p["packageId"], canon(p)
-        d = fresh.get(pid)
-        cacheable = True
-        if d is None:                            # AI failed twice
-            d = {"action": "open_exception", "vendorName": "unknown", "invoiceNumber": "unknown",
-                 "amountMinor": 0, "currency": "INR", "evidenceRefs": ["", "", ""], "reason": ""}
-            cacheable = False
-        elif d["action"] == "settle_invoice":
-            v = verdict_of.get(pid)
-            if v is None:                        # verifier failed -> never settle
-                d = {**d, "action": "open_exception"}
-                cacheable = False
-            elif settle_confirmed(v, text):
-                d = {**d, "reason": v.get("reason") or d.get("reason", "")}    # confirmed
-            elif v.get("action") in ACTIONS - {"settle_invoice"} and refs_ok(v.get("evidenceRefs"), text):
-                d = {**d, "action": v["action"], "evidenceRefs": v["evidenceRefs"], "reason": v.get("reason", "")}
-            else:                                # disagreement we can't resolve
-                d = {**d, "action": "open_exception"}
-        out[pid] = d
-        log_line({"packageId": pid, "first": (fresh.get(pid) or {}).get("action"),
-                  "final": d["action"], "refs": d["evidenceRefs"], "verdict": verdict_of.get(pid)})
-        if d["action"] == "settle_invoice":      # keep the text of every settle so you can read it
-            log_line({"SETTLED_PACKAGE": pid, "text": text})
-        if cacheable:
-            db.execute("INSERT OR REPLACE INTO cache VALUES(?,?)", (pkg_key(p), json.dumps(d)))
-    db.commit()
-    return out
-
-def proposal(p, d, policy):
-    a, r = d["action"], d["evidenceRefs"]
-    rationale = (f"Proposing {a} for invoice {d['invoiceNumber']} from {d['vendorName']}. "
-                 f"{d.get('reason', '')} Evidence {r[0]}, {r[1]} and {r[2]} in the controlling paragraph support {a}.")[:1500]
-    return {"packageId": p["packageId"], "actionId": "act-" + uuid.uuid4().hex, "action": a,
-            "facts": {"vendorName": d["vendorName"], "invoiceNumber": d["invoiceNumber"],
-                      "amountMinor": d["amountMinor"], "currency": d["currency"]},
-            "evidenceRefs": r, "rationale": rationale}
-
-# ---------- message:send ----------
-@app.post("/a2a/message:send")
-async def message_send(req: Request):
-    principal, bad = gate(req, post=True)
-    if bad: return bad
-    try:
-        body = await req.json(); msg = body["message"]; mid = msg["messageId"]
-        assert isinstance(msg["parts"], list)
-    except Exception:
-        return err(400, "INVALID_REQUEST")
-    h = sha(canon(msg))              # configuration is ignored on purpose
-    lock = key_locks.setdefault((principal, mid), asyncio.Lock())
-    async with lock:
-        with dblock:
-            seen = db.execute("SELECT hash, task_id FROM msgs WHERE principal=? AND mid=?", (principal, mid)).fetchone()
-        if seen:
-            if seen[0] != h: return err(409, "IDEMPOTENCY_CONFLICT", "Message id reused with different content")
-            return reply({"task": load(seen[1], principal)})
-        part = msg["parts"][0]
-        if msg.get("taskId"):
-            return continuation(principal, msg, part, mid, h)
-        if part.get("mediaType") != BATCH_T: return err(400, "INVALID_REQUEST")
-        data = part["data"]; pkgs = data["packages"]
-        decisions = await decide(data["policyRevision"], pkgs)       # the only AI call
-        props = [proposal(p, decisions[p["packageId"]], data["policyRevision"]) for p in pkgs]
-        tid, cid = str(uuid.uuid4()), str(uuid.uuid4())
-        task = {"id": tid, "contextId": cid,
-                "status": {"state": "TASK_STATE_INPUT_REQUIRED", "timestamp": now()},
-                "artifacts": [{"artifactId": "proposals", "name": "invoice-action-proposals",
-                               "parts": [{"mediaType": PROP_T, "data": {"batchId": data["batchId"], "proposals": props}}]}],
-                "history": [{**msg, "taskId": tid, "contextId": cid}]}
-        with dblock:                                                # store BEFORE responding
-            save(task, principal)
-            db.execute("INSERT INTO msgs VALUES(?,?,?,?)", (principal, mid, h, tid))
-            db.commit()
-        return reply({"task": task})
-
-def continuation(principal, msg, part, mid, h):
-    with dblock:
-        task = load(msg["taskId"], principal)
-        if not task: return err(404, "NOT_FOUND", "Task not found")
-        if msg.get("contextId") != task["contextId"]: return err(400, "INVALID_REQUEST")
-        if task["status"]["state"] != "TASK_STATE_INPUT_REQUIRED": return err(409, "TASK_NOT_ACTIONABLE")
-        if part.get("mediaType") != RES_T: return err(400, "INVALID_REQUEST")
-        stored = task["artifacts"][0]["parts"][0]["data"]
-        data = part["data"]
-        if data.get("batchId") != stored["batchId"]: return err(400, "INVALID_REQUEST")
-        byid = {p["packageId"]: p for p in stored["proposals"]}
-        execs, seen = [], set()
-        for r in data.get("results", []):
-            p = byid.get(r.get("packageId"))
-            if (not p or r["packageId"] in seen or r.get("actionId") != p["actionId"]
-                    or r.get("action") != p["action"] or r.get("outcome") not in ("ACCEPTED", "REJECTED")):
-                return err(400, "INVALID_REQUEST")
-            seen.add(r["packageId"])
-            if r["outcome"] == "ACCEPTED":
-                if not r.get("receiptNonce"): return err(400, "INVALID_REQUEST")
-                execs.append({"packageId": p["packageId"], "actionId": p["actionId"], "action": p["action"],
-                              "receiptNonce": r["receiptNonce"], "facts": p["facts"], "evidenceRefs": p["evidenceRefs"]})
-        task["artifacts"].append({"artifactId": "receipts", "name": "invoice-action-receipts",
-                                  "parts": [{"mediaType": REC_T, "data": {"batchId": stored["batchId"], "executions": execs}}]})
-        task["history"].append({**msg})
-        task["status"] = {"state": "TASK_STATE_COMPLETED", "timestamp": now()}
-        save(task, principal)
-        db.execute("INSERT INTO msgs VALUES(?,?,?,?)", (principal, mid, h, task["id"]))
-        db.commit()
-        return reply({"task": task})
-
-# ---------- reads, list, cancel (NO model calls) ----------
-@app.get("/a2a/tasks/{tid}")
-def get_task(tid: str, req: Request):
-    principal, bad = gate(req)
-    if bad: return bad
-    with dblock: t = load(tid, principal)
-    return reply(t) if t else err(404, "NOT_FOUND", "Task not found")
-
-MAX_LIST_BYTES = 350_000
-
-@app.get("/a2a/tasks")
-def list_tasks(req: Request):
-    principal, bad = gate(req)
-    if bad: return bad
-    with dblock:
-        rows = db.execute(
-            "SELECT body FROM tasks WHERE principal=? ORDER BY rowid DESC LIMIT 20",
-            (principal,)).fetchall()
-    tasks, size = [], 0
-    for (b,) in rows:
-        t = {k: v for k, v in json.loads(b).items() if k != "history"}   # drop the huge history
-        n = len(json.dumps(t))
-        if tasks and size + n > MAX_LIST_BYTES:
-            break
-        tasks.append(t)
-        size += n
-    return reply({"tasks": tasks})
-
-@app.post("/a2a/tasks/{tid}:cancel")
-def cancel(tid: str, req: Request):
-    principal, bad = gate(req)
-    if bad: return bad
-    with dblock:
-        t = load(tid, principal)
-        if not t: return err(404, "NOT_FOUND", "Task not found")
-        if t["status"]["state"] in TERMINAL: return err(409, "TASK_NOT_CANCELABLE")
-        t["status"] = {"state": "TASK_STATE_CANCELED", "timestamp": now()}
-        save(t, principal); db.commit()
-    return reply(t)
